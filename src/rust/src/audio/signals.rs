@@ -1,0 +1,237 @@
+use std::sync::Arc;
+
+use im::Vector;
+use tokio::sync::watch;
+use yandex_music::model::track::Track;
+
+use crate::audio::enums::RepeatMode;
+use crate::audio::monitor::Monitor;
+use crate::util::reactive::Signal;
+
+#[derive(Clone)]
+pub struct AudioSignals {
+    pub is_playing: Signal<bool>,
+    pub is_stopped: Signal<bool>,
+    pub is_buffering: Signal<bool>,
+    pub current_track: Signal<Option<Track>>,
+    pub current_track_id: Signal<Option<String>>,
+    pub title: Signal<Option<String>>,
+    pub artists: Signal<Option<String>>,
+    // Mirror of engine.pos(), published alongside TrackProgress.
+    pub position_ms: Signal<u64>,
+    pub duration_ms: Signal<u64>,
+    pub progress_ratio: Signal<f32>,
+    pub buffered_ratio: Signal<f32>,
+    pub volume: Signal<u8>,
+    pub is_muted: Signal<bool>,
+    pub queue: Signal<Vector<Track>>,
+    pub queue_index: Signal<usize>,
+    pub queue_length: Signal<usize>,
+    /// Bumped on every queue replacement/reorder so the UI can tell two
+    /// same-length queues apart (queue length alone does not change).
+    pub queue_revision: Signal<u32>,
+    pub repeat_mode: Signal<RepeatMode>,
+    pub is_shuffled: Signal<bool>,
+    pub current_wave_seeds: Signal<Vec<String>>,
+    /// Projection of the active playback context, kept in sync with
+    /// QueueManager's playback_context (and the wave extension path).
+    pub playback_context: Signal<Option<crate::api::models::PlaybackContextDto>>,
+    /// Crossfade length in milliseconds (0 = strict gapless without overlap).
+    /// Written by the settings API (and the startup loader), read by the
+    /// controller's monitor trigger and the crossfade path.
+    pub crossfade_ms: Signal<u32>,
+    pub codec: Signal<Option<String>>,
+    pub discord_rpc: Signal<bool>,
+    pub selected_device: Signal<Option<String>>,
+    /// False when the wave shader is disabled in settings — the bridge worker
+    /// skips VibeTick computation entirely (see workers.rs).
+    pub vibe_enabled: Signal<bool>,
+    pub monitor: Arc<Monitor>,
+    // Channel for notification of any signal change (except progress)
+    pub changed: watch::Sender<()>,
+    pub changed_rx: watch::Receiver<()>,
+    // Channel for notification of library changes (likes, playlists)
+    pub library_changed: watch::Sender<()>,
+    pub library_changed_rx: watch::Receiver<()>,
+    // Channel for notification of progress change
+    pub progress_changed: watch::Sender<u32>,
+    pub progress_rx: watch::Receiver<u32>,
+}
+
+/// Overlap window used when the crossfade toggle is on and a track has no
+/// server fade region of its own. Not user-configurable.
+pub const USER_CROSSFADE_MS: u32 = 6_000;
+
+impl AudioSignals {
+    pub fn new() -> Self {
+        let (changed_tx, changed_rx) = watch::channel(());
+        let (library_changed_tx, library_changed_rx) = watch::channel(());
+        let (progress_tx, progress_rx) = watch::channel(0u32);
+        Self {
+            is_playing: Signal::new(false),
+            is_stopped: Signal::new(true),
+            is_buffering: Signal::new(false),
+            current_track: Signal::new(None),
+            current_track_id: Signal::new(None),
+            title: Signal::new(None),
+            artists: Signal::new(None),
+            position_ms: Signal::new(0),
+            duration_ms: Signal::new(0),
+            progress_ratio: Signal::new(0.0),
+            buffered_ratio: Signal::new(0.0),
+            volume: Signal::new(100),
+            is_muted: Signal::new(false),
+            queue: Signal::new(Vector::new()),
+            queue_index: Signal::new(0),
+            queue_length: Signal::new(0),
+            queue_revision: Signal::new(0),
+            repeat_mode: Signal::new(RepeatMode::None),
+            is_shuffled: Signal::new(false),
+            current_wave_seeds: Signal::new(Vec::new()),
+            playback_context: Signal::new(None),
+            crossfade_ms: Signal::new(0),
+            codec: Signal::new(None),
+            discord_rpc: Signal::new(false),
+            selected_device: Signal::new(None),
+            vibe_enabled: Signal::new(true),
+            monitor: Arc::new(Monitor::new(1024)),
+            changed: changed_tx,
+            changed_rx,
+            library_changed: library_changed_tx,
+            library_changed_rx,
+            progress_changed: progress_tx,
+            progress_rx,
+        }
+    }
+
+    pub fn set_current_track(&self, track: Option<Track>) {
+        if let Some(t) = &track {
+            self.title.set(t.title.clone());
+            self.artists.set(Some(
+                t.artists
+                    .iter()
+                    .filter_map(|a| a.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+            self.current_track_id.set(Some(t.id.clone()));
+
+            // 0 = unknown: a duration-less track must not inherit the
+            // previous track's value (a natural end would read as ended-early).
+            self.duration_ms
+                .set(t.duration.map_or(0, |d| d.as_millis() as u64));
+            self.is_stopped.set(false);
+        } else {
+            self.title.set(None);
+            self.artists.set(None);
+            self.current_track_id.set(None);
+            self.duration_ms.set(0);
+            self.is_stopped.set(true);
+        }
+        self.current_track.set(track);
+        self.changed.send_replace(());
+    }
+
+    pub fn set_playing(&self, playing: bool) {
+        self.is_playing.set(playing);
+        self.changed.send_replace(());
+    }
+
+    pub fn update_progress(&self, position_ms: u64, duration_ms: u64) {
+        self.position_ms.set(position_ms);
+        self.duration_ms.set(duration_ms);
+
+        let ratio = if duration_ms > 0 {
+            (position_ms as f32 / duration_ms as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.progress_ratio.set(ratio);
+        // Notify progress listeners
+        self.progress_changed.send_replace(position_ms as u32);
+    }
+
+    pub fn update_buffered_ratio(&self, ratio: f32) {
+        self.buffered_ratio.set(ratio.clamp(0.0, 1.0));
+    }
+
+    pub fn set_queue(&self, queue: Vector<Track>, index: usize) {
+        self.queue.set(queue.clone());
+        self.queue_index.set(index);
+        self.queue_length.set(queue.len());
+        self.queue_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
+        self.changed.send_replace(());
+    }
+
+    pub fn set_volume(&self, volume: u8, muted: bool) {
+        self.volume.set(volume);
+        self.is_muted.set(muted);
+        self.changed.send_replace(());
+    }
+
+    pub fn set_repeat_mode(&self, repeat: RepeatMode) {
+        self.repeat_mode.set(repeat);
+        self.changed.send_replace(());
+    }
+
+    pub fn set_shuffled(&self, shuffled: bool) {
+        self.is_shuffled.set(shuffled);
+        self.changed.send_replace(());
+    }
+
+    pub fn set_wave_seeds(&self, seeds: Vec<String>) {
+        self.current_wave_seeds.set(seeds);
+        self.changed.send_replace(());
+    }
+
+    pub fn set_buffering(&self, buffering: bool) {
+        self.is_buffering.set(buffering);
+        self.changed.send_replace(());
+    }
+
+    pub fn set_stream_info(&self, codec: Option<String>) {
+        self.codec.set(codec);
+        self.changed.send_replace(());
+    }
+}
+
+impl Default for AudioSignals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_queue_bumps_revision() {
+        let signals = AudioSignals::new();
+        assert_eq!(signals.queue_revision.get(), 0);
+
+        signals.set_queue(Vector::new(), 0);
+        assert_eq!(signals.queue_revision.get(), 1);
+
+        // A same-length replacement must still be observable.
+        signals.set_queue(Vector::new(), 0);
+        assert_eq!(signals.queue_revision.get(), 2);
+    }
+
+    #[test]
+    fn durationless_track_resets_stale_duration() {
+        let signals = AudioSignals::new();
+        let with_duration: Track = serde_json::from_value(
+            serde_json::json!({ "id": "1", "realId": "1", "durationMs": 213_000 }),
+        )
+        .expect("test track JSON must deserialize");
+        signals.set_current_track(Some(with_duration));
+        assert_eq!(signals.duration_ms.get(), 213_000);
+
+        // The next track carries no duration: the old value must not leak
+        // (a stale one makes a natural end classify as ended_early).
+        signals.set_current_track(Some(crate::util::track::test_track("2")));
+        assert_eq!(signals.duration_ms.get(), 0);
+    }
+}
